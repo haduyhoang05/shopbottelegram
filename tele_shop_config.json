@@ -1,0 +1,15 @@
+{
+  "admin_id": 5232744626,
+  "bot_token": "8651294428:AAGF26aEdY645pXXgCGfGt3mopMbAGihNhg",
+  "log_group_id": 0,
+  "start_video_path": "",
+  "vietqr_bank_name": "BIDV",
+  "vietqr_bank_id": "bidv",
+  "vietqr_stk": "5321405395",
+  "vietqr_ctk": "HA DUY HOANG",
+  "vietqr_template": "compact2",
+  "bank_v3_name": "Vietcombank",
+  "bank_v3_token": "",
+  "poll_interval": 15,
+  "auto_bank_api_text": ""
+}

@@ -1,0 +1,25 @@
+/start: Mở menu chính và kiểm tra số dư.
+
+/getchatid: Lấy dãy số ID để điền vào ô Admin ID trên máy tính.
+
+/checkadmin: Kích hoạt quyền Admin để hiện nút "Admin Panel".
+
+/addcat [Tên]: Tạo chuyên mục mới (Ví dụ: /addcat Tài khoản VIP).
+
+/editcat [ID] [Tên mới]: Sửa tên chuyên mục (Ví dụ: /editcat 1 ChatGPT).
+
+/delcat [ID]: Xóa chuyên mục.
+
+/addprod [CAT_ID] | [Tên] | [Giá] | [Kho] | [Nội dung]: Thêm sản phẩm (Giá/Kho phải là số, không dùng chữ "k").
+
+/editprod [PROD_ID] | [Tên] | [Giá] | [Kho] | [Nội dung]: Sửa sản phẩm.
+
+/delprod [PROD_ID]: Xóa sản phẩm.
+
+/coupon [CODE] | [Tiền giảm] | [% giảm] | [all/ID_SP] | [Đơn tối thiểu] | [Lượt dùng]: Tạo mã giảm giá.
+
+/couponoff [CODE]: Tắt mã giảm giá.
+
+/broadcast [Nội dung]: Gửi thông báo cho tất cả khách hàng.
+
+/setcomm [USER_ID] [PERCENT]: Cài đặt % hoa hồng cho cộng tác viên.
