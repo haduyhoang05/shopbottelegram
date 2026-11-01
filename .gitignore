@@ -1,0 +1,18 @@
+# Configuration file containing secrets
+tele_shop_config.json
+
+# SQLite database
+tele_shop.sqlite3
+tele_shop.sqlite3-journal
+tele_shop.sqlite3-wal
+tele_shop.sqlite3-shm
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Environment & logs
+.env
+*.log

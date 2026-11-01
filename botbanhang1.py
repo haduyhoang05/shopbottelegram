@@ -61,9 +61,7 @@ CODERENT_V2_CODES = {
     "TheSieuRe": "TSR",
 }
 
-NAPID_RE = re.compile(r"\bNapid\s+(\d+)\b", re.IGNORECASE)
-
-ADMIN_MODE = set()
+NAPID_RE = re.compile(r"\bNapid\s*(\d+)\b", re.IGNORECASE)
 
 # =========================================================
 # HELPERS
@@ -75,6 +73,14 @@ def now_str() -> str:
 def safe_int(x, default=0) -> int:
     try:
         return int(str(x).replace(",", "").strip())
+    except Exception:
+        return default
+
+
+def safe_pos_int(x, default=0) -> int:
+    try:
+        val = int(str(x).replace(",", "").strip())
+        return val if val > 0 else default
     except Exception:
         return default
 
@@ -107,7 +113,7 @@ def build_coderent_v2_url(bank_name: str, token: str) -> str:
 # DB
 # =========================================================
 def db_connect():
-    con = sqlite3.connect(DB_FILE, check_same_thread=False)
+    con = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30.0)
     con.row_factory = sqlite3.Row
     return con
 
@@ -219,6 +225,17 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bot_settings(
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_product_items_prod_sold ON product_items(product_id, is_sold)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id)")
+
     con.commit()
     con.close()
 
@@ -294,6 +311,8 @@ def add_balance(user_id: int, amount: int):
 
 
 def subtract_balance(user_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return True
     con = db_connect()
     cur = con.cursor()
     cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
@@ -305,10 +324,11 @@ def subtract_balance(user_id: int, amount: int) -> bool:
     if bal < amount:
         con.close()
         return False
-    cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (int(amount), user_id))
+    cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (int(amount), user_id, int(amount)))
+    affected = cur.rowcount
     con.commit()
     con.close()
-    return True
+    return affected > 0
 
 
 # ---------- categories/products ----------
@@ -347,15 +367,24 @@ def list_categories():
     return rows
 
 
-def edit_product(pid: int, name: str, price: int, stock: int, deliver_text: str):
+def edit_product(pid: int, name: str, price: int, new_items: Optional[List[str]] = None) -> int:
     con = db_connect()
     cur = con.cursor()
+    if new_items:
+        for item in new_items:
+            cur.execute(
+                "INSERT INTO product_items(product_id, data_text, is_sold) VALUES(?,?,0)",
+                (pid, item),
+            )
+    cur.execute("SELECT COUNT(*) AS unsold FROM product_items WHERE product_id=? AND is_sold=0", (pid,))
+    actual_stock = int(cur.fetchone()["unsold"])
     cur.execute(
-        "UPDATE products SET name=?, price=?, stock=?, deliver_text=? WHERE id=?",
-        (name, int(price), int(stock), deliver_text or "", pid),
+        "UPDATE products SET name=?, price=?, stock=? WHERE id=?",
+        (name, int(price), actual_stock, pid),
     )
     con.commit()
     con.close()
+    return actual_stock
 
 
 def delete_product(pid: int):
@@ -600,8 +629,12 @@ class BotRunner:
         self._bot_thread: Optional[threading.Thread] = None
         self._bank_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._bank_wake_event = threading.Event()
         self._bot_loop: Optional[asyncio.AbstractEventLoop] = None
         self._bot_username: Optional[str] = None
+
+        self._admin_lock = threading.Lock()
+        self._admin_mode: set = set()
 
         self._buy_cache: Dict[int, Dict[str, Any]] = {}
 
@@ -610,6 +643,27 @@ class BotRunner:
             self.log_queue.put(f"[{now_str()}] {msg}")
         except Exception:
             pass
+
+    def is_admin_mode(self, user_id: int) -> bool:
+        with self._admin_lock:
+            return user_id in self._admin_mode
+
+    def enable_admin_mode(self, user_id: int):
+        with self._admin_lock:
+            self._admin_mode.add(user_id)
+
+    def disable_admin_mode(self, user_id: int):
+        with self._admin_lock:
+            self._admin_mode.discard(user_id)
+
+    def _clear_user_state(self, context: ContextTypes.DEFAULT_TYPE):
+        if context.user_data is not None:
+            context.user_data.pop("waiting_deposit_amount", None)
+            context.user_data.pop("waiting_input_qty_pid", None)
+
+    def update_config(self, cfg: BotConfig):
+        self.cfg = cfg
+        self._bank_wake_event.set()
 
     # =========================
     # TELEGRAM UI
@@ -620,7 +674,7 @@ class BotRunner:
             [InlineKeyboardButton("💳               Nạp tiền               ", callback_data="u:deposit"),
              InlineKeyboardButton("🧾               Lịch sử mua            ", callback_data="u:history")],
         ]
-        if user_id in ADMIN_MODE:
+        if self.is_admin_mode(user_id):
             rows.append([InlineKeyboardButton("🛠 Admin Panel", callback_data="a:panel")])
         return InlineKeyboardMarkup(rows)
 
@@ -722,6 +776,7 @@ class BotRunner:
     # TELEGRAM HANDLERS
     # =========================
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self._clear_user_state(context)
         user = update.effective_user
         upsert_user(user)
 
@@ -751,12 +806,13 @@ class BotRunner:
         user = update.effective_user
         upsert_user(user)
         if user.id == int(self.cfg.admin_id or 0):
-            ADMIN_MODE.add(user.id)
+            self.enable_admin_mode(user.id)
             await update.message.reply_text("✅ Đã bật chế độ Admin ẩn.", reply_markup=self.user_main_keyboard(user.id))
         else:
             await update.message.reply_text("❌ Bạn không phải admin.")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self._clear_user_state(context)
         txt = (
             "📌 Lệnh:\n"
             "/start\n"
@@ -783,7 +839,7 @@ class BotRunner:
 
         data = q.data or ""
         if data == "u:home":
-            context.user_data["waiting_input_qty_pid"] = None
+            self._clear_user_state(context)
             bal = get_balance(user.id)
             await q.edit_message_text(
                 f"🏠 Menu chính\n💰 Số dư: <b>{bal:,}đ</b>",
@@ -793,7 +849,7 @@ class BotRunner:
             return
 
         if data == "u:cats":
-            context.user_data["waiting_input_qty_pid"] = None
+            self._clear_user_state(context)
             cats = list_categories()
             if not cats:
                 await q.edit_message_text("❌ Chưa có chuyên mục. Admin thêm chuyên mục trước.", reply_markup=self.user_main_keyboard(user.id))
@@ -806,7 +862,7 @@ class BotRunner:
             return
 
         if data.startswith("u:cat:"):
-            context.user_data["waiting_input_qty_pid"] = None
+            self._clear_user_state(context)
             cid = safe_int(data.split(":")[2], 0)
             prods = list_products_by_category(cid)
             if not prods:
@@ -823,6 +879,7 @@ class BotRunner:
             return
 
         if data.startswith("u:prod:"):
+            self._clear_user_state(context)
             pid = safe_int(data.split(":")[2], 0)
             prod = get_product(pid)
             if not prod:
@@ -857,6 +914,7 @@ class BotRunner:
             return
 
         if data.startswith("u:qty:"):
+            self._clear_user_state(context)
             parts = data.split(":")
             pid = safe_int(parts[2], 0)
             qty = safe_int(parts[3], 1)
@@ -866,7 +924,6 @@ class BotRunner:
                 await q.edit_message_text("❌ Kho không đủ số lượng bạn yêu cầu.", reply_markup=self.user_main_keyboard(user.id))
                 return
                 
-            context.user_data["waiting_input_qty_pid"] = None
             self._buy_cache[user.id] = {"product_id": pid, "quantity": qty}
             total_price = int(prod["price"]) * qty
             
@@ -889,10 +946,12 @@ class BotRunner:
             return
 
         if data == "u:pay:balance":
-            await self._finalize_purchase_with_qty(user.id, message=q.message, context=context)
+            self._clear_user_state(context)
+            await self._finalize_purchase_with_qty(user.id, context=context, query=q)
             return
 
         if data == "u:pay:bank":
+            self._clear_user_state(context)
             cache = self._buy_cache.get(user.id)
             if not cache:
                 await q.edit_message_text("❌ Không tìm thấy thông tin đơn hàng.", reply_markup=self.user_main_keyboard(user.id))
@@ -929,18 +988,20 @@ class BotRunner:
                 f"✅ Nội dung bắt buộc: <code>{add_info}</code>\n\n"
                 f"📌 <b>LƯU Ý:</b> Hệ thống AutoBank sẽ tự quét ngân hàng mỗi 15 giây. "
                 f"Ngay sau khi bạn chuyển tiền thành công, hệ thống sẽ tự nạp tiền vào ví của bạn, "
-                f"Duy hãy bấm lại vào <b>Chuyên mục -> Chọn sản phẩm đó -> Chọn thanh toán bằng số dư ví</b> để nhận hàng nhé!\n\n"
+                f"sau đó hãy bấm lại vào <b>Chuyên mục -> Chọn sản phẩm đó -> Chọn thanh toán bằng số dư ví</b> để nhận hàng nhé!\n\n"
                 f"🔗 <b>MÃ QR THANH TOÁN:</b> {qr_url}"
             )
             await q.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=self.user_main_keyboard(user.id))
             return
 
         if data == "u:deposit":
+            self._clear_user_state(context)
             await q.edit_message_text("💳 Nhập số tiền bạn muốn nạp (VD: 50000):")
             context.user_data["waiting_deposit_amount"] = True
             return
 
         if data == "u:history":
+            self._clear_user_state(context)
             orders = list_orders(user.id, limit=15)
             if not orders:
                 await q.edit_message_text("🧾 Chưa có đơn hàng.", reply_markup=self.user_main_keyboard(user.id))
@@ -952,14 +1013,16 @@ class BotRunner:
             return
 
         if data == "a:panel":
-            if user.id not in ADMIN_MODE:
+            self._clear_user_state(context)
+            if not self.is_admin_mode(user.id):
                 await q.edit_message_text("❌ Chưa bật admin. Dùng /checkadmin", reply_markup=self.user_main_keyboard(user.id))
                 return
             await q.edit_message_text("🛠 <b>Admin Panel</b>", reply_markup=self.admin_keyboard(), parse_mode=ParseMode.HTML)
             return
 
         if data.startswith("a:"):
-            if user.id not in ADMIN_MODE:
+            self._clear_user_state(context)
+            if not self.is_admin_mode(user.id):
                 await q.edit_message_text("❌ Bạn không có quyền.", reply_markup=self.user_main_keyboard(user.id))
                 return
 
@@ -973,9 +1036,9 @@ class BotRunner:
             elif action == "addprod":
                 await q.edit_message_text(
                     "➕ <b>CÚ PHÁP THÊM SẢN PHẨM MỚI:</b>\n"
-                    "<code>/addprod CAT_ID | Tên SP | Giá | Danh sách nội dung (mỗi món 1 dòng)</code>\n\n"
+                    "<code>/addprod CAT_ID | Tên SP | Giá | Kho | Danh sách nội dung (mỗi món 1 dòng)</code>\n\n"
                     "<b>Ví dụ:</b>\n"
-                    "<code>/addprod 1 | Netflix 1 Tháng | 50000 |\n"
+                    "<code>/addprod 1 | Netflix 1 Tháng | 50000 | 2 |\n"
                     "tai_khoan_1@gmail.com/pass123\n"
                     "tai_khoan_2@gmail.com/pass456</code>",
                     parse_mode=ParseMode.HTML,
@@ -983,7 +1046,14 @@ class BotRunner:
                 )
             elif action == "editprod":
                 await q.edit_message_text(
-                    "✏️ Gửi:\n<code>/editprod PROD_ID | Tên SP | Giá | Kho | Nội dung giao</code>",
+                    "✏️ <b>CÚ PHÁP SỬA SẢN PHẨM:</b>\n"
+                    "<code>/editprod PROD_ID | Tên SP | Giá [| Kho | Nội dung thêm]</code>\n\n"
+                    "<b>Ví dụ sửa tên/giá:</b>\n"
+                    "<code>/editprod 1 | Netflix VIP | 60000</code>\n\n"
+                    "<b>Ví dụ nạp thêm kho:</b>\n"
+                    "<code>/editprod 1 | Netflix VIP | 60000 | 2 |\n"
+                    "acc1@gmail.com|pass1\n"
+                    "acc2@gmail.com|pass2</code>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=self.admin_keyboard(),
                 )
@@ -1011,10 +1081,13 @@ class BotRunner:
         text = (update.message.text or "").strip()
 
         if context.user_data.get("waiting_deposit_amount"):
-            context.user_data["waiting_deposit_amount"] = False
-            amt = safe_int(text, 0)
+            self._clear_user_state(context)
+            amt = safe_pos_int(text, 0)
             if amt <= 0:
-                await update.message.reply_text("❌ Số tiền không hợp lệ. Bấm Nạp tiền lại.", reply_markup=self.user_main_keyboard(user.id))
+                await update.message.reply_text(
+                    "❌ Số tiền không hợp lệ. Vui lòng bấm Nạp tiền lại và nhập số tiền lớn hơn 0.",
+                    reply_markup=self.user_main_keyboard(user.id),
+                )
                 return
             if not self.cfg.vietqr_stk or not self.cfg.vietqr_ctk or not self.cfg.vietqr_bank_id:
                 await update.message.reply_text("❌ Admin chưa cấu hình VietQR (STK/CTK/BANK).", reply_markup=self.user_main_keyboard(user.id))
@@ -1041,25 +1114,25 @@ class BotRunner:
 
         # XỬ LÝ KHI KHÁCH TỰ GÕ SỐ LƯỢNG TỪ BÀN PHÍM
         if context.user_data.get("waiting_input_qty_pid"):
-            pid = context.user_data["waiting_input_qty_pid"]
+            pid = context.user_data.get("waiting_input_qty_pid")
             qty = safe_int(text, 0)
             
             prod = get_product(pid)
             if not prod:
-                context.user_data["waiting_input_qty_pid"] = None
+                self._clear_user_state(context)
                 await update.message.reply_text("❌ Sản phẩm không còn tồn tại.", reply_markup=self.user_main_keyboard(user.id))
                 return
                 
             stock = int(prod["stock"] or 0)
             if qty <= 0:
-                await update.message.reply_text("❌ Số lượng phải là một số lớn hơn 0. Vui lòng nhập lại số lượng bằng số:")
+                await update.message.reply_text("❌ Số lượng phải là một số lớn hơn 0. Vui lòng nhập lại số lượng bằng số (hoặc bấm Menu để hủy):")
                 return
                 
             if qty > stock:
-                await update.message.reply_text(f"❌ Kho chỉ còn {stock} sản phẩm, không đủ. Vui lòng nhập lại số lượng:")
+                await update.message.reply_text(f"❌ Kho chỉ còn {stock} sản phẩm, không đủ. Vui lòng nhập lại số lượng (hoặc bấm Menu để hủy):")
                 return
                 
-            context.user_data["waiting_input_qty_pid"] = None
+            self._clear_user_state(context)
             self._buy_cache[user.id] = {"product_id": pid, "quantity": qty}
             total_price = int(prod["price"]) * qty
             
@@ -1083,84 +1156,166 @@ class BotRunner:
 
         await update.message.reply_text("Chọn chức năng trong menu nhé.", reply_markup=self.user_main_keyboard(user.id))
 
-    async def _finalize_purchase_with_qty(self, user_id: int, message, context: ContextTypes.DEFAULT_TYPE):
+    async def _finalize_purchase_with_qty(
+        self,
+        user_id: int,
+        context: ContextTypes.DEFAULT_TYPE,
+        query=None,
+        message=None,
+    ):
+        async def reply_error(err_text: str):
+            if query:
+                try:
+                    await query.edit_message_text(err_text, reply_markup=self.user_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+                    return
+                except Exception:
+                    pass
+            if message:
+                try:
+                    await message.reply_text(err_text, reply_markup=self.user_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+                    return
+                except Exception:
+                    pass
+            await context.bot.send_message(chat_id=user_id, text=err_text, reply_markup=self.user_main_keyboard(user_id), parse_mode=ParseMode.HTML)
+
         cache = self._buy_cache.get(user_id)
         if not cache:
-            await message.reply_text("❌ Không có giao dịch mua đang chờ.", reply_markup=self.user_main_keyboard(user_id))
+            await reply_error("❌ Không có giao dịch mua đang chờ.")
             return
             
         pid = cache.get("product_id")
-        qty = safe_int(cache.get("quantity"), 1)
-        
-        prod = get_product(pid)
-        if not prod or int(prod["stock"] or 0) < qty:
-            await message.reply_text("❌ Số lượng trong kho không đủ để thực hiện giao dịch.", reply_markup=self.user_main_keyboard(user_id))
-            return
+        qty = safe_pos_int(cache.get("quantity"), 1)
 
-        price_per_item = int(prod["price"])
-        total_price = price_per_item * qty
-        
-        bal = get_balance(user_id)
-        if bal < total_price:
-            await message.reply_text(
-                f"❌ Số dư không đủ.\n💰 Số dư hiện tại: {bal:,}đ\n🧾 Tổng tiền cần thanh toán ({qty} SP): {total_price:,}đ\n👉 Hãy nạp thêm tiền.",
-                reply_markup=self.user_main_keyboard(user_id),
-            )
-            return
-
-        if not subtract_balance(user_id, total_price):
-            await message.reply_text("❌ Trừ tiền thất bại. Vui lòng thử lại.", reply_markup=self.user_main_keyboard(user_id))
-            return
-            
         con = db_connect()
-        cur = con.cursor()
-        
-        cur.execute(
-            "SELECT id, data_text FROM product_items WHERE product_id=? AND is_sold=0 LIMIT ?",
-            (pid, qty)
-        )
-        items = cur.fetchall()
-        
-        if len(items) < qty:
-            con.close()
-            add_balance(user_id, total_price)
-            await message.reply_text("❌ Kho hàng phát sinh lỗi thiếu hụt đột xuất. Tiền đã hoàn lại ví.", reply_markup=self.user_main_keyboard(user_id))
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            cur = con.cursor()
+
+            # 1. Kiểm tra sản phẩm và kho
+            cur.execute("SELECT id, name, price, stock, is_active FROM products WHERE id=? AND is_active=1", (pid,))
+            prod = cur.fetchone()
+            if not prod:
+                con.rollback()
+                await reply_error("❌ Sản phẩm không tồn tại hoặc đã ngừng kinh doanh.")
+                return
+
+            stock = int(prod["stock"] or 0)
+            if stock < qty:
+                con.rollback()
+                await reply_error(f"❌ Số lượng trong kho không đủ (còn {stock} SP, yêu cầu {qty} SP).")
+                return
+
+            price_per_item = int(prod["price"])
+            total_price = price_per_item * qty
+
+            # 2. Kiểm tra số dư người dùng
+            cur.execute("SELECT balance, ref_by FROM users WHERE user_id=?", (user_id,))
+            user_row = cur.fetchone()
+            bal = int(user_row["balance"] or 0) if user_row else 0
+            if bal < total_price:
+                con.rollback()
+                await reply_error(
+                    f"❌ Số dư không đủ.\n💰 Số dư hiện tại: <b>{bal:,}đ</b>\n"
+                    f"🧾 Tổng tiền cần thanh toán ({qty} SP): <b>{total_price:,}đ</b>\n👉 Hãy nạp thêm tiền."
+                )
+                return
+
+            # 3. Lấy đúng số lượng item chưa bán trong transaction
+            cur.execute(
+                "SELECT id, data_text FROM product_items WHERE product_id=? AND is_sold=0 LIMIT ?",
+                (pid, qty)
+            )
+            items = cur.fetchall()
+            if len(items) < qty:
+                con.rollback()
+                await reply_error("❌ Kho hàng phát sinh thiếu hụt đột xuất. Giao dịch đã hủy, số dư chưa bị trừ.")
+                return
+
+            # 4. Đánh dấu is_sold = 1
+            for item in items:
+                cur.execute("UPDATE product_items SET is_sold=1 WHERE id=? AND is_sold=0", (item["id"],))
+                if cur.rowcount == 0:
+                    con.rollback()
+                    await reply_error("❌ Một trong các món hàng vừa được bán cho người khác. Vui lòng thử lại.")
+                    return
+
+            # 5. Trừ kho trong bảng products
+            cur.execute("UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ?", (qty, pid, qty))
+            if cur.rowcount == 0:
+                con.rollback()
+                await reply_error("❌ Kho hàng thay đổi đột xuất, không đủ số lượng để trừ.")
+                return
+
+            # 6. Trừ tiền ví của user
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (total_price, user_id, total_price))
+            if cur.rowcount == 0:
+                con.rollback()
+                await reply_error("❌ Trừ tiền thất bại (số dư không đủ).")
+                return
+
+            # 7. Tạo đơn hàng
+            cur.execute("""
+                INSERT INTO orders(user_id, product_id, price, discount, final_price, coupon_code, status, created_at)
+                VALUES(?,?,?,?,?,?,?,?)
+            """, (user_id, pid, total_price, 0, total_price, None, "PAID", now_str()))
+            order_id = cur.lastrowid
+
+            # 8. Hoa hồng Affiliate nếu có người giới thiệu
+            ref_by = user_row["ref_by"] if user_row else None
+            if ref_by and ref_by != user_id:
+                cur.execute("SELECT percent FROM affiliate WHERE user_id=?", (ref_by,))
+                aff_row = cur.fetchone()
+                pct = int(aff_row["percent"]) if aff_row else 5
+                comm = int((total_price * pct) / 100)
+                if comm > 0:
+                    cur.execute("UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id=?", (comm, ref_by))
+                    cur.execute("""
+                        INSERT INTO affiliate_earnings(referrer_id, referred_user_id, order_id, amount, created_at)
+                        VALUES(?,?,?,?,?)
+                    """, (ref_by, user_id, order_id, comm, now_str()))
+
+            con.commit()
+        except Exception as e:
+            con.rollback()
+            self.log(f"Lỗi hoàn tất đơn hàng: {e}")
+            await reply_error("❌ Đã có lỗi xảy ra trong quá trình xử lý đơn hàng. Vui lòng thử lại.")
             return
-            
-        deliver_items_text = []
-        for item in items:
-            deliver_items_text.append(f"▪️ <code>{item['data_text']}</code>")
-            cur.execute("UPDATE product_items SET is_sold=1 WHERE id=?", (item['id'],))
-            
-        cur.execute("UPDATE products SET stock = stock - ? WHERE id=?", (qty, pid))
-        con.commit()
-        con.close()
+        finally:
+            con.close()
 
-        order_id = create_order(
-            user_id=user_id,
-            product_id=pid,
-            price=total_price,
-            discount=0,
-            final_price=total_price,
-            coupon_code=None,
-            status="PAID",
-        )
+        self._buy_cache.pop(user_id, None)
 
+        deliver_items_text = [f"▪️ <code>{item['data_text']}</code>" for item in items]
         items_delivery_string = "\n".join(deliver_items_text)
-        
-        await message.reply_text(
-            "✅ <b>MUA HÀNG THÀNH CÔNG</b>\n"
-            f"🧾 Mã đơn hàng: <b>#{order_id}</b>\n"
-            f"🛒 Sản phẩm: <b>{prod['name']}</b>\n"
-            f"🔢 Số lượng mua: <b>{qty} SP</b>\n"
-            f"✅ Tổng thanh toán: <b>{total_price:,}đ</b>\n\n"
-            f"📦 <b>THÔNG TIN SẢN PHẨM CỦA BẠN:</b>\n"
-            f"{items_delivery_string}\n\n"
-            f"<i>Cảm ơn bạn đã tin tưởng ủng hộ cửa hàng!</i>",
+
+        # Cập nhật tin nhắn inline callback nếu có
+        if query:
+            try:
+                await query.edit_message_text(
+                    f"✅ <b>Thanh toán đơn #{order_id} thành công!</b>\nThông tin chi tiết đã được gửi bên dưới 👇",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+        # Gửi thông tin sản phẩm về chat riêng của user
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ <b>MUA HÀNG THÀNH CÔNG</b>\n"
+                f"🧾 Mã đơn hàng: <b>#{order_id}</b>\n"
+                f"🛒 Sản phẩm: <b>{prod['name']}</b>\n"
+                f"🔢 Số lượng mua: <b>{qty} SP</b>\n"
+                f"✅ Tổng thanh toán: <b>{total_price:,}đ</b>\n\n"
+                f"📦 <b>THÔNG TIN SẢN PHẨM CỦA BẠN:</b>\n"
+                f"{items_delivery_string}\n\n"
+                f"<i>Cảm ơn bạn đã tin tưởng ủng hộ cửa hàng!</i>"
+            ),
             parse_mode=ParseMode.HTML,
-            reply_markup=self.user_main_keyboard(user_id)
+            reply_markup=self.user_main_keyboard(user_id),
         )
 
+        # Thông báo cho admin
         if int(self.cfg.admin_id or 0) > 0:
             try:
                 await context.bot.send_message(
@@ -1170,7 +1325,17 @@ class BotRunner:
             except Exception:
                 pass
 
-        self._buy_cache.pop(user_id, None)
+        # Gửi log vào nhóm
+        await self._notify_purchase_log(
+            context.bot,
+            user_id=user_id,
+            order_id=order_id,
+            prod_name=prod["name"],
+            price=total_price,
+            discount=0,
+            final_price=total_price,
+            coupon_code=None,
+        )
 
     # =========================
     # ADMIN COMMANDS
@@ -1183,7 +1348,7 @@ class BotRunner:
         if not self._is_admin(uid):
             await update.message.reply_text("❌ Không có quyền admin.")
             return False
-        if uid not in ADMIN_MODE:
+        if not self.is_admin_mode(uid):
             await update.message.reply_text("⚠️ Bật admin trước bằng /checkadmin")
             return False
         return True
@@ -1233,37 +1398,58 @@ class BotRunner:
             return
         
         raw = update.message.text.replace("/addprod", "", 1).strip()
-        parts = self._parse_pipe(raw)
+        parts = [x.strip() for x in raw.split("|", 4)]
         
         if len(parts) < 4:
             await update.message.reply_text(
                 "➕ <b>CÚ PHÁP THÊM SẢN PHẨM MỚI:</b>\n"
-                "<code>/addprod CAT_ID | Tên SP | Giá | Danh sách nội dung (mỗi món 1 dòng)</code>\n\n"
+                "<code>/addprod CAT_ID | Tên SP | Giá | Kho | Danh sách nội dung (mỗi món 1 dòng)</code>\n\n"
                 "<b>Ví dụ:</b>\n"
-                "<code>/addprod 1 | Netflix 1 Tháng | 50000 |\n"
+                "<code>/addprod 1 | Netflix 1 Tháng | 50000 | 2 |\n"
                 "tai_khoan_1@gmail.com/pass123\n"
-                "tai_khoan_2@gmail.com/pass456</code>",
+                "tai_khoan_2@gmail.com/pass456</code>\n\n"
+                "<i>Ghi chú: [Kho] nên là số lượng món dự kiến, hệ thống sẽ tự đếm số dòng nội dung thực tế.</i>",
                 parse_mode=ParseMode.HTML
             )
             return
             
-        cid = safe_int(parts[0], 0)
+        cid = safe_pos_int(parts[0], 0)
         name = parts[1]
-        price = safe_int(parts[2], 0)
+        price = safe_pos_int(parts[2], 0)
         
-        raw_items = parts[3].split("\n")
-        items_list = [line.strip() for line in raw_items if line.strip()]
-        stock = len(items_list)
+        if len(parts) >= 5:
+            p3 = parts[3]
+            if p3.isdigit() and "\n" not in p3:
+                stock_declared = safe_int(p3, 0)
+                raw_items = parts[4]
+            else:
+                stock_declared = -1
+                raw_items = p3 + " | " + parts[4]
+        else:
+            stock_declared = -1
+            raw_items = parts[3]
+            
+        items_list = [line.strip() for line in raw_items.splitlines() if line.strip()]
+        actual_stock = len(items_list)
         
-        if cid <= 0 or not name or price <= 0 or stock == 0:
-            await update.message.reply_text("❌ Dữ liệu không hợp lệ hoặc nội dung sản phẩm trống.")
+        if cid <= 0:
+            await update.message.reply_text("❌ Mã chuyên mục (CAT_ID) phải là số > 0.")
+            return
+        if not name:
+            await update.message.reply_text("❌ Tên sản phẩm không được để trống.")
+            return
+        if price <= 0:
+            await update.message.reply_text("❌ Giá sản phẩm phải lớn hơn 0.")
+            return
+        if actual_stock == 0:
+            await update.message.reply_text("❌ Danh sách nội dung sản phẩm trống. Mỗi món phải nằm trên 1 dòng.")
             return
             
         con = db_connect()
         cur = con.cursor()
         cur.execute(
             "INSERT INTO products(category_id, name, price, stock, deliver_text, is_active) VALUES(?,?,?,?,?,1)",
-            (cid, name, int(price), stock, "Hàng giao tự động bên dưới:"),
+            (cid, name, int(price), actual_stock, "Hàng giao tự động bên dưới:"),
         )
         pid = cur.lastrowid
         
@@ -1276,26 +1462,74 @@ class BotRunner:
         con.commit()
         con.close()
         
-        await update.message.reply_text(f"✅ Đã thêm sản phẩm <b>{name}</b> (Mã SP: #{pid}) thành công!\n📦 Hệ thống nhận diện: <b>{stock}</b> nội dung sản phẩm trong kho.", parse_mode=ParseMode.HTML)
+        warn_text = ""
+        if stock_declared >= 0 and stock_declared != actual_stock:
+            warn_text = f"\n⚠️ <i>Lưu ý: Số kho bạn nhập ({stock_declared}) khác số dòng thực tế ({actual_stock}). Hệ thống cập nhật kho = {actual_stock}.</i>"
+            
+        await update.message.reply_text(
+            f"✅ Đã thêm sản phẩm <b>{name}</b> (Mã SP: #{pid}) thành công!\n"
+            f"📦 Hệ thống nhận diện: <b>{actual_stock}</b> nội dung sản phẩm trong kho.{warn_text}",
+            parse_mode=ParseMode.HTML
+        )
 
     async def cmd_editprod(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.admin_guard(update):
             return
         raw = update.message.text.replace("/editprod", "", 1).strip()
-        parts = self._parse_pipe(raw)
-        if len(parts) < 5:
-            await update.message.reply_text("Dùng: /editprod PROD_ID | Tên SP | Giá | Kho | Nội dung giao")
+        parts = [x.strip() for x in raw.split("|", 4)]
+        if len(parts) < 3:
+            await update.message.reply_text(
+                "✏️ <b>CÚ PHÁP SỬA SẢN PHẨM:</b>\n"
+                "<code>/editprod PROD_ID | Tên SP | Giá [| Kho | Nội dung thêm]</code>\n\n"
+                "<b>Ví dụ sửa tên/giá:</b>\n"
+                "<code>/editprod 1 | Netflix VIP | 60000</code>\n\n"
+                "<b>Ví dụ nạp thêm kho:</b>\n"
+                "<code>/editprod 1 | Netflix VIP | 60000 | 2 |\n"
+                "acc1@gmail.com|pass1\n"
+                "acc2@gmail.com|pass2</code>",
+                parse_mode=ParseMode.HTML
+            )
             return
-        pid = safe_int(parts[0], 0)
+            
+        pid = safe_pos_int(parts[0], 0)
         name = parts[1]
-        price = safe_int(parts[2], 0)
-        stock = safe_int(parts[3], 0)
-        deliver = parts[4]
-        if pid <= 0 or not name or price <= 0:
-            await update.message.reply_text("❌ Sai dữ liệu.")
+        price = safe_pos_int(parts[2], 0)
+        
+        if pid <= 0:
+            await update.message.reply_text("❌ Mã sản phẩm (PROD_ID) phải là số > 0.")
             return
-        edit_product(pid, name, price, stock, deliver)
-        await update.message.reply_text(f"✅ Đã sửa sản phẩm #{pid}")
+        prod = get_product(pid)
+        if not prod:
+            await update.message.reply_text(f"❌ Không tìm thấy sản phẩm #{pid} (hoặc sản phẩm đã bị xóa).")
+            return
+        if not name:
+            await update.message.reply_text("❌ Tên sản phẩm không được để trống.")
+            return
+        if price <= 0:
+            await update.message.reply_text("❌ Giá sản phẩm phải lớn hơn 0 (không được âm hoặc bằng 0).")
+            return
+            
+        new_items_list = []
+        if len(parts) >= 5:
+            p3 = parts[3]
+            if p3.isdigit() and "\n" not in p3:
+                raw_items = parts[4]
+            else:
+                raw_items = p3 + " | " + parts[4]
+            new_items_list = [line.strip() for line in raw_items.splitlines() if line.strip()]
+        elif len(parts) == 4:
+            raw_items = parts[3]
+            if "\n" in raw_items or not raw_items.isdigit():
+                new_items_list = [line.strip() for line in raw_items.splitlines() if line.strip()]
+
+        actual_stock = edit_product(pid, name, price, new_items=new_items_list)
+        
+        add_text = f"\n📦 Đã nạp thêm <b>{len(new_items_list)}</b> món mới vào kho." if new_items_list else ""
+        await update.message.reply_text(
+            f"✅ Đã cập nhật sản phẩm <b>#{pid}</b> (Tên: <b>{name}</b>, Giá: <b>{price:,}đ</b>).\n"
+            f"📦 Kho thực tế hiện có: <b>{actual_stock}</b> món.{add_text}",
+            parse_mode=ParseMode.HTML
+        )
 
     async def cmd_delprod(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.admin_guard(update):
@@ -1330,11 +1564,17 @@ class BotRunner:
         if not code:
             await update.message.reply_text("❌ CODE rỗng.")
             return
+        if damt < 0 or min_order < 0 or max_uses < 0:
+            await update.message.reply_text("❌ Tiền giảm, đơn tối thiểu và lượt dùng không được là số âm.")
+            return
         if dpct < 0 or dpct > 100:
             await update.message.reply_text("❌ % giảm không hợp lệ (0-100).")
             return
+        if damt == 0 and dpct == 0:
+            await update.message.reply_text("❌ Phải có tiền giảm hoặc % giảm lớn hơn 0.")
+            return
         if apply_pid is not None and apply_pid <= 0:
-            await update.message.reply_text("❌ apply_prod_id_or_all phải là all hoặc số ID sản phẩm.")
+            await update.message.reply_text("❌ apply_prod_id_or_all phải là all hoặc số ID sản phẩm > 0.")
             return
         upsert_coupon(code, damt, dpct, apply_pid, min_order, max_uses)
         await update.message.reply_text(f"✅ Đã tạo/cập nhật coupon {code}")
@@ -1358,7 +1598,7 @@ class BotRunner:
         uid = safe_int(context.args[0], 0)
         pct = safe_int(context.args[1], 0)
         if uid <= 0 or pct < 0 or pct > 100:
-            await update.message.reply_text("❌ Sai dữ liệu.")
+            await update.message.reply_text("❌ Sai dữ liệu (USER_ID > 0, 0 <= PERCENT <= 100).")
             return
         set_aff_percent(uid, pct)
         await update.message.reply_text(f"✅ Đã set hoa hồng user {uid} = {pct}%")
@@ -1424,7 +1664,33 @@ class BotRunner:
 
             txs = data.get("transactions", []) or []
             self.log(f"Transactions found: {len(txs)}")
+            if not txs:
+                return
 
+            # Kiểm tra xem hệ thống đã từng đồng bộ lịch sử ban đầu chưa
+            con_init = db_connect()
+            cur_init = con_init.cursor()
+            cur_init.execute("SELECT value FROM bot_settings WHERE key='bank_synced_once'")
+            synced_row = cur_init.fetchone()
+            if not synced_row:
+                cur_init.execute("SELECT COUNT(*) AS cnt FROM bank_seen")
+                seen_cnt = cur_init.fetchone()["cnt"]
+                if seen_cnt == 0:
+                    self.log("ℹ️ Cơ sở dữ liệu mới: Đánh dấu các giao dịch cũ đã có trên ngân hàng là đã xử lý để tránh nạp trùng.")
+                    for tx in txs:
+                        tid = str(tx.get("transactionID", "")).strip()
+                        if tid:
+                            cur_init.execute("INSERT OR IGNORE INTO bank_seen(transaction_id, seen_at) VALUES(?,?)", (tid, now_str()))
+                    cur_init.execute("INSERT OR REPLACE INTO bot_settings(key, value) VALUES('bank_synced_once', '1')")
+                    con_init.commit()
+                    con_init.close()
+                    return
+                else:
+                    cur_init.execute("INSERT OR REPLACE INTO bot_settings(key, value) VALUES('bank_synced_once', '1')")
+                    con_init.commit()
+            con_init.close()
+
+            # Xử lý các giao dịch nạp tiền
             for tx in txs:
                 ttype = str(tx.get("type", "")).upper().strip()
                 if ttype != "IN":
@@ -1437,38 +1703,78 @@ class BotRunner:
                 if not tid or amount <= 0:
                     continue
 
-                if bank_tx_seen(tid):
-                    continue
+                credited = False
+                user_id = 0
 
-                mark_bank_tx_seen(tid)
+                con = db_connect()
+                try:
+                    con.execute("BEGIN IMMEDIATE")
+                    cur = con.cursor()
 
-                m = re.search(r"napid\s*(\d+)", desc, re.IGNORECASE)
-                if not m:
-                    continue
+                    cur.execute("SELECT transaction_id FROM bank_seen WHERE transaction_id=?", (tid,))
+                    if cur.fetchone():
+                        con.rollback()
+                        continue
 
-                user_id = safe_int(m.group(1), 0)
-                if user_id <= 0:
-                    continue
+                    m = NAPID_RE.search(desc)
+                    if not m:
+                        # Giao dịch không khớp cú pháp Napid, đánh dấu đã xem để không quét lại
+                        cur.execute("INSERT OR IGNORE INTO bank_seen(transaction_id, seen_at) VALUES(?,?)", (tid, now_str()))
+                        con.commit()
+                        continue
 
-                add_balance(user_id, amount)
-                create_deposit(user_id, amount, desc, tid, "SUCCESS")
+                    user_id = safe_int(m.group(1), 0)
+                    if user_id <= 0:
+                        cur.execute("INSERT OR IGNORE INTO bank_seen(transaction_id, seen_at) VALUES(?,?)", (tid, now_str()))
+                        con.commit()
+                        continue
 
-                self.log(f"Deposit credited: user={user_id} amount={amount} tid={tid}")
+                    # Tạo user nếu chưa tồn tại
+                    cur.execute("""
+                        INSERT OR IGNORE INTO users(user_id, username, first_name, balance, ref_by, created_at)
+                        VALUES(?, '', '', 0, NULL, ?)
+                    """, (user_id, now_str()))
 
-                if self._app and self._bot_loop:
-                    bot = self._app.bot
-                    asyncio.run_coroutine_threadsafe(
-                        self._notify_deposit(bot, user_id, amount, tid),
-                        self._bot_loop,
-                    )
-                    asyncio.run_coroutine_threadsafe(
-                        self._notify_admin_deposit(bot, user_id, amount, tid, desc),
-                        self._bot_loop,
-                    )
-                    asyncio.run_coroutine_threadsafe(
-                        self._notify_deposit_log(bot, user_id, amount, tid, desc),
-                        self._bot_loop,
-                    )
+                    # Cộng tiền vào ví
+                    cur.execute("""
+                        UPDATE users
+                        SET balance = COALESCE(balance, 0) + ?
+                        WHERE user_id=?
+                    """, (amount, user_id))
+
+                    # Ghi nhận lịch sử nạp
+                    cur.execute("""
+                        INSERT INTO deposits(user_id, amount, description, trans_id, status, created_at)
+                        VALUES(?,?,?,?,?,?)
+                    """, (user_id, amount, desc, tid, "SUCCESS", now_str()))
+
+                    # Đánh dấu đã xử lý giao dịch
+                    cur.execute("INSERT OR IGNORE INTO bank_seen(transaction_id, seen_at) VALUES(?,?)", (tid, now_str()))
+
+                    con.commit()
+                    credited = True
+                except Exception as e:
+                    con.rollback()
+                    self.log(f"Lỗi credit giao dịch #{tid}: {e}")
+                finally:
+                    con.close()
+
+                if credited and user_id > 0:
+                    self.log(f"Deposit credited: user={user_id} amount={amount} tid={tid}")
+                    if self._app and self._bot_loop:
+                        bot = self._app.bot
+                        asyncio.run_coroutine_threadsafe(
+                            self._notify_deposit(bot, user_id, amount, tid),
+                            self._bot_loop,
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self._notify_admin_deposit(bot, user_id, amount, tid, desc),
+                            self._bot_loop,
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            self._notify_deposit_log(bot, user_id, amount, tid, desc),
+                            self._bot_loop,
+                        )
 
         except Exception as e:
             self.log(f"Bank poll error: {e}")
@@ -1480,7 +1786,9 @@ class BotRunner:
                 self.poll_bank_and_credit_sync()
             except Exception as e:
                 self.log(f"Bank loop error: {e}")
-            self._stop_event.wait(max(5, int(self.cfg.poll_interval or 15)))
+            interval = max(5, int(self.cfg.poll_interval or 15))
+            self._bank_wake_event.clear()
+            self._bank_wake_event.wait(timeout=interval)
         self.log("Bank poll thread stopped.")
 
     # =========================
@@ -1554,6 +1862,7 @@ class BotRunner:
             raise RuntimeError("Chưa nhập ADMIN ID")
 
         self._stop_event.clear()
+        self._bank_wake_event.clear()
 
         self._bot_thread = threading.Thread(target=self._bot_thread_main, daemon=True)
         self._bot_thread.start()
@@ -1565,6 +1874,7 @@ class BotRunner:
 
     def stop(self):
         self._stop_event.set()
+        self._bank_wake_event.set()
         self.log("⛔ Stopping...")
 
 
@@ -1738,10 +2048,11 @@ class AppGUI(ctk.CTk):
             "• Bank poll sẽ quét API V3 và cộng tiền tự động.\n"
             "• Đơn mua hàng và nạp tiền có thể log vào nhóm Telegram.\n\n"
             "Admin:\n"
-            "• /checkadmin (ẩn)\n"
+            "• /checkadmin (kích hoạt quyền admin)\n"
             "• /getchatid để lấy chat id nhóm\n"
             "• Thêm chuyên mục: /addcat ...\n"
-            "• Thêm sản phẩm: /addprod CAT_ID | Tên | Giá | Danh sách nội dung (mỗi món một dòng)\n"
+            "• Thêm sản phẩm: /addprod CAT_ID | Tên | Giá | Kho | Nội dung (mỗi món một dòng)\n"
+            "• Sửa sản phẩm: /editprod PROD_ID | Tên | Giá [| Kho | Nội dung thêm]\n"
         )
         self.txt_log.insert("1.0", hint)
 
@@ -1783,8 +2094,8 @@ class AppGUI(ctk.CTk):
     def save_cfg_ui(self):
         self.cfg = self.read_cfg_from_ui()
         save_config(self.cfg)
-        self.runner.cfg = self.cfg
-        self._append_log("✅ Đã lưu cấu hình.")
+        self.runner.update_config(self.cfg)
+        self._append_log("✅ Đã lưu cấu hình (áp dụng ngay chu kỳ poll mới).")
 
     def start_clicked(self):
         try:
